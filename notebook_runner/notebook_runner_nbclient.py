@@ -340,20 +340,32 @@ def execute_notebook(notebook_path: Path, output_notebook_path: Path,
     
     # Create a custom executor that respects skip flags
     class SkipCellExecutor(NotebookClient):
-        """Custom executor that skips cells marked with skip flag.
+        """Custom executor that skips cells by tags or indices.
         
-        This executor extends NotebookClient to support skipping cells by tags or indices.
-        When a cell is marked to skip, it is not executed but preserved in the notebook.
-        The key is to override async_execute_cell which is the actual method nbclient uses.
+        This executor extends NotebookClient to support skipping cells based on:
+        - Cell indices (0-based)
+        - Cell tags (metadata.tags)
+        
+        Cells are skipped without execution but preserved in the output notebook.
+        This approach avoids using execution.skip metadata which causes JSON schema validation errors.
         """
         
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args, skip_indices=None, skip_tags=None, **kwargs):
+            """Initialize executor with skip criteria.
+            
+            Args:
+                skip_indices: Set of cell indices to skip (0-based)
+                skip_tags: Set of tags; cells with any of these tags will be skipped
+                *args, **kwargs: Passed to parent NotebookClient
+            """
             super().__init__(*args, **kwargs)
+            self.skip_indices = skip_indices or set()
+            self.skip_tags = skip_tags or set()
             self.code_cells_count = len([c for c in self.nb.cells if c.cell_type == 'code'])
             self.current_code_cell = 0
         
         async def async_execute_cell(self, cell, cell_index, execution_count=None, store_history=True):
-            """Override async_execute_cell to skip cells marked for skipping.
+            """Override async_execute_cell to skip cells based on indices or tags.
             
             This is the async method that nbclient actually uses internally.
             We override this to properly handle cell skipping without breaking kernel startup.
@@ -371,8 +383,9 @@ def execute_notebook(notebook_path: Path, output_notebook_path: Path,
             if cell.cell_type == 'code':
                 self.current_code_cell += 1
                 
-            # Check if cell should be skipped
-            if cell.metadata.get('execution', {}).get('skip', False):
+            # Check if cell should be skipped using skip_indices and skip_tags
+            # This uses the same logic as the should_skip_cell function
+            if should_skip_cell(cell, cell_index, self.skip_indices, self.skip_tags):
                 logger.info(f"  [{self.current_code_cell}/{self.code_cells_count}] [SKIP] Cell {cell_index}")
                 # Mark cell as not executed but keep it in notebook
                 cell.execution_count = None
@@ -452,12 +465,17 @@ def execute_notebook(notebook_path: Path, output_notebook_path: Path,
         # Create client with timeout (None if 0)
         actual_timeout = timeout if timeout > 0 else None
         
+        # Create custom executor with skip criteria
+        # Pass skip_indices and skip_tags so executor can determine which cells to skip
+        # This avoids using execution.skip metadata which causes JSON schema validation errors
         client = SkipCellExecutor(
             notebook,
             timeout=actual_timeout,
             kernel_name=kernel_name,
             allow_errors=False,
-            record_timing=True
+            record_timing=True,
+            skip_indices=skip_indices,
+            skip_tags=skip_tags
         )
         
         client.execute()
