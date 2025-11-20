@@ -319,8 +319,9 @@ def execute_notebook(notebook_path: Path, output_notebook_path: Path,
             continue
             
         if should_skip_cell(cell, idx, skip_indices, skip_tags):
-            # Mark cell as skipped by adding a metadata flag
-            cell.metadata['execution'] = {'skip': True}
+            # Cell will be skipped during execution based on tags/indices
+            # No need to set execution.skip metadata (causes JSON schema validation errors)
+            # Tags alone are sufficient for the executor to identify and skip cells
             skipped_count += 1
             
             # Get cell preview
