@@ -17,6 +17,8 @@ import subprocess
 import os
 import json
 import logging
+import time
+import requests
 from pathlib import Path
 from typing import Set, List, Optional
 
@@ -249,6 +251,73 @@ def should_skip_cell(cell: dict, cell_index: int, skip_indices: Set[int], skip_t
     return False
 
 
+def is_health_check_cell(cell: dict) -> bool:
+    """Check if a cell contains RAG server health check code.
+    
+    This function detects cells that test the RAG server health endpoint.
+    These cells need to wait for the server to be ready before execution.
+    """
+    if cell.get('cell_type') != 'code':
+        return False
+    
+    source = ''.join(cell.get('source', []))
+    # Check for health check patterns
+    health_patterns = [
+        '/v1/health',
+        'RAG_BASE_URL',
+        'rag-server',
+        'health endpoint',
+        'health_check'
+    ]
+    
+    # Check if cell contains health check related code
+    source_lower = source.lower()
+    return any(pattern.lower() in source_lower for pattern in health_patterns)
+
+
+def wait_for_rag_server_ready(base_url: str = "http://0.0.0.0:8081", max_wait: int = 300, check_interval: int = 5):
+    """Wait for RAG server to be ready by polling health check endpoint.
+    
+    Args:
+        base_url: Base URL of RAG server (default: http://0.0.0.0:8081)
+        max_wait: Maximum time to wait in seconds (default: 300 = 5 minutes)
+        check_interval: Interval between checks in seconds (default: 5)
+        
+    Returns:
+        True if server is ready, False if timeout
+    """
+    health_url = f"{base_url}/v1/health"
+    start_time = time.time()
+    attempt = 0
+    
+    logger.info(f"Waiting for RAG server to be ready at {health_url}...")
+    logger.info(f"Maximum wait time: {max_wait} seconds, checking every {check_interval} seconds")
+    
+    while time.time() - start_time < max_wait:
+        attempt += 1
+        try:
+            response = requests.get(health_url, timeout=10)
+            if response.status_code == 200:
+                elapsed = time.time() - start_time
+                logger.info(f"✅ RAG server is ready! (waited {elapsed:.1f} seconds, {attempt} attempts)")
+                return True
+            else:
+                logger.debug(f"Health check returned status {response.status_code}, retrying...")
+        except requests.exceptions.RequestException as e:
+            # Server not ready yet, continue waiting
+            elapsed = time.time() - start_time
+            if attempt % 6 == 0:  # Log every 30 seconds (6 attempts * 5 seconds)
+                logger.info(f"  Waiting... ({elapsed:.0f}s elapsed, attempt {attempt})")
+            else:
+                logger.debug(f"  Connection failed (attempt {attempt}): {type(e).__name__}")
+        
+        time.sleep(check_interval)
+    
+    elapsed = time.time() - start_time
+    logger.error(f"❌ RAG server did not become ready within {max_wait} seconds (waited {elapsed:.1f}s, {attempt} attempts)")
+    return False
+
+
 def execute_notebook(notebook_path: Path, output_notebook_path: Path, 
                      env_vars: dict, skip_indices: Set[int], skip_tags: Set[str],
                      timeout: int = 600, kernel_name: str = None):
@@ -339,28 +408,125 @@ def execute_notebook(notebook_path: Path, output_notebook_path: Path,
     
     # Create a custom executor that respects skip flags
     class SkipCellExecutor(NotebookClient):
-        """Custom executor that skips cells marked with skip flag."""
+        """Custom executor that skips cells marked with skip flag.
+        
+        This executor extends NotebookClient to support skipping cells by tags or indices.
+        When a cell is marked to skip, it is not executed but preserved in the notebook.
+        The key is to override async_execute_cell which is the actual method nbclient uses.
+        """
         
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.code_cells_count = len([c for c in self.nb.cells if c.cell_type == 'code'])
             self.current_code_cell = 0
         
-        def execute_cell(self, cell, cell_index, execution_count=None):
-            """Override to skip cells marked for skipping."""
+        async def async_execute_cell(self, cell, cell_index, execution_count=None, store_history=True):
+            """Override async_execute_cell to skip cells marked for skipping.
+            
+            This is the async method that nbclient actually uses internally.
+            We override this to properly handle cell skipping without breaking kernel startup.
+            Also logs cell execution results including errors and outputs.
+            
+            Args:
+                cell: The notebook cell to execute
+                cell_index: Index of the cell in the notebook
+                execution_count: Optional execution count
+                store_history: Whether to store execution history
+                
+            Returns:
+                The executed (or skipped) cell
+            """
             if cell.cell_type == 'code':
                 self.current_code_cell += 1
                 
+            # Check if cell should be skipped
             if cell.metadata.get('execution', {}).get('skip', False):
                 logger.info(f"  [{self.current_code_cell}/{self.code_cells_count}] [SKIP] Cell {cell_index}")
-                # Keep the cell but mark it as not executed
+                # Mark cell as not executed but keep it in notebook
                 cell.execution_count = None
+                # Clear any existing outputs
+                if hasattr(cell, 'outputs'):
+                    cell.outputs = []
                 return cell
             
             if cell.cell_type == 'code':
-                logger.info(f"  [{self.current_code_cell}/{self.code_cells_count}] Executing cell {cell_index}...")
+                # Log cell source preview (first 100 chars)
+                source_preview = cell.source[:100].replace('\n', ' ').strip()
+                if len(cell.source) > 100:
+                    source_preview += "..."
+                logger.info(f"  [{self.current_code_cell}/{self.code_cells_count}] Executing cell {cell_index}: {source_preview}")
+                
+                # Check if this is a health check cell and wait for RAG server to be ready
+                # This prevents ServerDisconnectedError when server is still starting up
+                if is_health_check_cell(cell):
+                    logger.info(f"  [{self.current_code_cell}/{self.code_cells_count}] [WAIT] Detected health check cell, waiting for RAG server to be ready...")
+                    # Try to extract RAG_BASE_URL from cell source or use default
+                    source_str = ''.join(cell.source) if isinstance(cell.source, list) else str(cell.source)
+                    base_url = "http://0.0.0.0:8081"  # Default RAG server URL
+                    
+                    # Try to extract RAG_BASE_URL from cell source
+                    import re
+                    rag_url_match = re.search(r'RAG_BASE_URL\s*=\s*["\']([^"\']+)["\']', source_str)
+                    if rag_url_match:
+                        base_url = rag_url_match.group(1)
+                        logger.info(f"  Found RAG_BASE_URL in cell: {base_url}")
+                    
+                    # Wait for server to be ready (max 5 minutes)
+                    if not wait_for_rag_server_ready(base_url, max_wait=300, check_interval=5):
+                        logger.warning(f"  ⚠️  RAG server may not be ready, but proceeding with cell execution...")
             
-            return super().execute_cell(cell, cell_index, execution_count)
+            # Call parent's async_execute_cell for normal execution
+            # This ensures kernel is properly initialized and cell is executed
+            executed_cell = await super().async_execute_cell(cell, cell_index, execution_count, store_history)
+            
+            # After execution, check for errors and log outputs
+            if cell.cell_type == 'code' and hasattr(executed_cell, 'outputs'):
+                has_error = False
+                error_outputs = []
+                stdout_outputs = []
+                
+                for output in executed_cell.outputs:
+                    output_type = output.get('output_type', '')
+                    
+                    if output_type == 'error':
+                        has_error = True
+                        error_info = {
+                            'ename': output.get('ename', 'Unknown'),
+                            'evalue': output.get('evalue', ''),
+                            'traceback': output.get('traceback', [])
+                        }
+                        error_outputs.append(error_info)
+                    elif output_type == 'stream':
+                        stream_name = output.get('name', '')
+                        text = output.get('text', '')
+                        if stream_name == 'stdout' and text:
+                            stdout_outputs.append(text)
+                    elif output_type == 'execute_result':
+                        data = output.get('data', {})
+                        if 'text/plain' in data:
+                            stdout_outputs.append(data['text/plain'])
+                
+                # Log error if present
+                if has_error and error_outputs:
+                    logger.error(f"  [{self.current_code_cell}/{self.code_cells_count}] [ERROR] Cell {cell_index} failed:")
+                    for err in error_outputs:
+                        logger.error(f"    Exception: {err['ename']}: {err['evalue']}")
+                        if err.get('traceback'):
+                            logger.error("    Traceback:")
+                            for tb_line in err['traceback'][:10]:  # Limit to first 10 lines
+                                logger.error(f"      {tb_line.rstrip()}")
+                elif stdout_outputs:
+                    # Log stdout output (limit to first 500 chars per output)
+                    for output_text in stdout_outputs[:3]:  # Limit to first 3 outputs
+                        output_preview = str(output_text)[:500].replace('\n', ' ')
+                        if len(str(output_text)) > 500:
+                            output_preview += "..."
+                        logger.info(f"  [{self.current_code_cell}/{self.code_cells_count}] [OUTPUT] Cell {cell_index}: {output_preview}")
+                else:
+                    # Cell executed successfully but no output
+                    logger.info(f"  [{self.current_code_cell}/{self.code_cells_count}] [OK] Cell {cell_index} completed")
+            
+            return executed_cell
     
     # Execute notebook
     logger.info("Starting notebook execution...")
